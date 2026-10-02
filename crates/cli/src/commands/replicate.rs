@@ -3724,7 +3724,17 @@ mod tests {
             }),
         };
 
-        let code = execute(args, OutputConfig::default()).await;
+        // JSON mode refuses without prompting, so the result doesn't depend on whether the test
+        // runner's stdin is a TTY. Otherwise, without JSON mode, the command would prompt for
+        // confirmation and block the test if stdin is a terminal.
+        let code = execute(
+            args,
+            OutputConfig {
+                json: true,
+                ..OutputConfig::default()
+            },
+        )
+        .await;
 
         assert_eq!(code, ExitCode::UsageError);
     }

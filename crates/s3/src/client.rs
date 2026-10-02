@@ -4297,13 +4297,14 @@ impl S3Client {
             write,
             precondition,
         };
-        // RustFS evaluates write preconditions for multipart completion. Keep
-        // ordinary small uploads on PutObject, but route conditional path writes
-        // through multipart so mirror retains compare-and-swap semantics on the
-        // currently deployed service.
-        if Self::should_use_multipart(file_size)
-            || !matches!(precondition, ObjectWritePrecondition::None)
-        {
+        // Route only genuinely large files through multipart, instead of forcing also all
+        // conditional path writes through the multipart route.  RustFS enforces the
+        // If-None-Match/If-Match write preconditions on PutObject itself (not just on
+        // CompleteMultipartUpload) since 1.0.0-alpha.47 (rustfs/rustfs#409), returning
+        // 412 Precondition Failed, which the single-part path maps to Error::Conflict.
+        // Small conditional mirror writes therefore keep compare-and-swap semantics on
+        // a single PutObject, so there is no need to pay for three multipart round trips.
+        if Self::should_use_multipart(file_size) {
             self.put_object_multipart_from_path(path, file_path, file_size, options, on_progress)
                 .await
         } else {
@@ -9001,10 +9002,13 @@ mod tests {
         };
         let path = RemotePath::new("test", "bucket", "key.txt");
         let mut source = tempfile::NamedTempFile::new().expect("create upload source");
-        source.write_all(b"path-data").expect("write upload source");
+        // Create file larger than the multipart split threshold to ensure multipart upload is used.
+        let data = vec![0u8; (SINGLE_PUT_OBJECT_MAX_SIZE + 1) as usize];
+        source.write_all(&data).expect("write upload source");
 
         let (path_upload_client, path_upload_replay) = test_s3_client_with_response_sequence(vec![
             multipart_create_response(),
+            multipart_part_response(),
             multipart_part_response(),
             complete_response(),
         ]);
@@ -9013,15 +9017,16 @@ mod tests {
             .await
             .expect("conditional path upload");
         let path_upload_requests = path_upload_replay.actual_requests().collect::<Vec<_>>();
-        assert_eq!(path_upload_requests.len(), 3);
+        assert_eq!(path_upload_requests.len(), 4);
         assert_eq!(
-            path_upload_requests[2].headers().get("if-none-match"),
+            path_upload_requests[3].headers().get("if-none-match"),
             Some("*")
         );
 
         let (matched_upload_client, matched_upload_replay) =
             test_s3_client_with_response_sequence(vec![
                 multipart_create_response(),
+                multipart_part_response(),
                 multipart_part_response(),
                 complete_response(),
             ]);
@@ -9037,15 +9042,81 @@ mod tests {
             .await
             .expect("matched path upload");
         let matched_upload_requests = matched_upload_replay.actual_requests().collect::<Vec<_>>();
-        assert_eq!(matched_upload_requests.len(), 3);
+        assert_eq!(matched_upload_requests.len(), 4);
         assert_eq!(
-            matched_upload_requests[2].headers().get("if-match"),
+            matched_upload_requests[3].headers().get("if-match"),
             Some("expected-etag")
         );
     }
 
     #[tokio::test]
-    async fn conditional_empty_path_write_uploads_one_empty_part() {
+    async fn conditional_small_path_writes_use_single_put_with_precondition_headers() {
+        // Small conditional mirror writes must go out as one PutObject carrying the
+        // precondition header, not as a three-request multipart upload. RustFS enforces
+        // If-None-Match/If-Match on PutObject since 1.0.0-alpha.47 (rustfs/rustfs#409).
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create upload source");
+        source.write_all(b"path-data").expect("write upload source");
+
+        let (path_upload_client, path_upload_replay) =
+            test_s3_client_with_response_sequence(vec![put_object_ok_response()]);
+        path_upload_client
+            .put_object_from_path_if_absent(&path, source.path(), None, None, |_| {})
+            .await
+            .expect("conditional path upload");
+        let path_upload_requests = path_upload_replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(path_upload_requests.len(), 1);
+        assert!(!path_upload_requests[0].uri().contains("uploadId"));
+        assert_eq!(
+            path_upload_requests[0].headers().get("if-none-match"),
+            Some("*")
+        );
+
+        let (matched_upload_client, matched_upload_replay) =
+            test_s3_client_with_response_sequence(vec![put_object_ok_response()]);
+        matched_upload_client
+            .put_object_from_path_if_match(
+                &path,
+                source.path(),
+                None,
+                None,
+                "expected-etag",
+                |_| {},
+            )
+            .await
+            .expect("matched path upload");
+        let matched_upload_requests = matched_upload_replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(matched_upload_requests.len(), 1);
+        assert_eq!(
+            matched_upload_requests[0].headers().get("if-match"),
+            Some("expected-etag")
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_empty_path_write_uses_single_put() {
+        // A zero-byte conditional write is below the multipart threshold, so it also
+        // goes out as a single PutObject while keeping the precondition header.
+        let (client, replay) =
+            test_s3_client_with_response_sequence(vec![put_object_ok_response()]);
+        let path = RemotePath::new("test", "bucket", "empty.txt");
+        let source = tempfile::NamedTempFile::new().expect("create empty upload source");
+
+        client
+            .put_object_from_path_if_absent(&path, source.path(), None, None, |_| {})
+            .await
+            .expect("conditional empty path upload");
+
+        let requests = replay.actual_requests().collect::<Vec<_>>();
+        assert_eq!(requests.len(), 1);
+        assert!(!requests[0].uri().contains("uploadId"));
+        assert_eq!(requests[0].headers().get("if-none-match"), Some("*"));
+    }
+
+    #[tokio::test]
+    async fn conditional_empty_multipart_uploads_one_empty_part() {
+        // The multipart path still emits exactly one empty part for a zero-byte object
+        // so the conditional completion request can evaluate the destination precondition.
         let complete_response = http::Response::builder()
             .status(200)
             .header("content-type", "application/xml")
@@ -9060,11 +9131,21 @@ mod tests {
         ]);
         let path = RemotePath::new("test", "bucket", "empty.txt");
         let source = tempfile::NamedTempFile::new().expect("create empty upload source");
+        let write = ObjectWriteOptions::default();
 
         client
-            .put_object_from_path_if_absent(&path, source.path(), None, None, |_| {})
+            .put_object_multipart_from_path(
+                &path,
+                source.path(),
+                0,
+                PathUploadOptions {
+                    write: &write,
+                    precondition: ObjectWritePrecondition::IfAbsent,
+                },
+                |_| {},
+            )
             .await
-            .expect("conditional empty path upload");
+            .expect("conditional empty multipart upload");
 
         let requests = replay.actual_requests().collect::<Vec<_>>();
         assert_eq!(requests.len(), 3);
@@ -9088,6 +9169,68 @@ mod tests {
             .header("etag", "\"part-etag\"")
             .body(SdkBody::empty())
             .expect("build multipart part response")
+    }
+
+    fn put_object_ok_response() -> http::Response<SdkBody> {
+        http::Response::builder()
+            .status(200)
+            .header("etag", "\"final-etag\"")
+            .body(SdkBody::empty())
+            .expect("build put object response")
+    }
+
+    #[tokio::test]
+    async fn conditional_small_put_conflict_maps_to_conflict_error() {
+        // RustFS returns 412 Precondition Failed when the single-part conditional write
+        // loses the compare-and-swap; the dispatch must surface it as Error::Conflict.
+        let conflict_response = http::Response::builder()
+            .status(412)
+            .body(SdkBody::empty())
+            .expect("build precondition-failed response");
+        let (client, _receiver) = test_s3_client(Some(conflict_response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create upload source");
+        source.write_all(b"path-data").expect("write upload source");
+
+        let error = client
+            .put_object_from_path_if_absent(&path, source.path(), None, None, |_| {})
+            .await
+            .expect_err("conditional conflict should error");
+        assert!(
+            matches!(error, Error::Conflict(_)),
+            "expected Error::Conflict, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_small_put_if_match_conflict_maps_to_conflict_error() {
+        // The If-Match single-part branch must map a lost compare-and-swap the same way the
+        // If-None-Match branch does. This path is the fragile one against non-RustFS targets
+        // that may not honor If-Match on PutObject, so cover its conflict mapping explicitly.
+        let conflict_response = http::Response::builder()
+            .status(412)
+            .body(SdkBody::empty())
+            .expect("build precondition-failed response");
+        let (client, _receiver) = test_s3_client(Some(conflict_response));
+        let path = RemotePath::new("test", "bucket", "key.txt");
+        let mut source = tempfile::NamedTempFile::new().expect("create upload source");
+        source.write_all(b"path-data").expect("write upload source");
+
+        let error = client
+            .put_object_from_path_if_match(
+                &path,
+                source.path(),
+                None,
+                None,
+                "expected-etag",
+                |_| {},
+            )
+            .await
+            .expect_err("conditional conflict should error");
+        assert!(
+            matches!(error, Error::Conflict(_)),
+            "expected Error::Conflict, got {error:?}"
+        );
     }
 
     fn test_object_retention(mode: RetentionMode) -> ObjectRetention {
